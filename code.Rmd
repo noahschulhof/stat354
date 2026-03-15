@@ -1,0 +1,455 @@
+---
+title: "STAT 354 Project"
+author: "Noah Schulhof"
+date: today
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+# Load Packages
+
+```{r}
+library(tidyverse)
+library(data.table)
+```
+
+
+# Data Preprocessing
+
+```{r}
+if (!(file.exists('data/counts.csv'))){
+  dfs <- lapply(zip_files, function(z) {
+
+    csv_names <- unzip(z, list = TRUE)$Name
+    
+    print(paste('Reading',
+                csv_names[1]))
+  
+    lapply(csv_names, function(csv_name) {
+  
+      read_csv(
+        unz(z, csv_name),
+        col_select = started_at,
+        show_col_types = FALSE
+      )
+  
+    })
+
+  })
+  
+  started_times <- rbindlist(unlist(dfs, recursive = FALSE))
+  
+  df <- as.data.frame(started_times)
+
+  df$date <- as.Date(df$started_at)
+  
+  counts <- df %>% 
+    group_by(date) %>% 
+    summarize(count = n()) %>% 
+    filter(date >= as.Date('2021-01-01')) %>% 
+    arrange(date)
+  
+  write.csv(counts, 'data/counts.csv', row.names = F)
+  
+}
+```
+
+## Find number of daily rentals
+
+```{r}
+counts = read.csv('data/counts.csv') %>% 
+  mutate(date = as.Date(date))
+
+print(paste('Mean:',
+      mean(counts$count)))
+
+print(paste('Dispersion:',
+            var(counts$count) / mean(counts$count)))
+```
+
+## Plot the resulting time series
+
+```{r}
+xt <- counts$count
+
+png('plots/bike_counts.png', width = 800)
+
+plot(counts$date, 
+     xt,
+     type = 'l',
+     xlab = 'Date',
+     ylab = 'Count',
+     main = 'NYC Citi Bike Rental Count by Date')
+
+dev.off()
+```
+
+## Examine the ACF of the raw and differenced time series
+
+```{r}
+png('plots/acf.png', width = 600)
+
+acf(xt, main = 'ACF')
+
+dev.off()
+```
+
+```{r}
+xt_diff <- diff(xt)
+
+png('plots/acf_diff.png', width = 600)
+
+acf(xt_diff, main = 'ACF of Differenced Series')
+
+dev.off()
+```
+
+
+
+# Fit SARIMA(p, d = 1, q) x (P, D = 0, Q) with S = 7
+
+The differenced counts appear approximately stationary. We will fit an ARIMA(p, d = 1, q) model, and choose the values of p and q that minimize the AIC.
+
+```{r, results='hide'}
+train_window <- 730 # 2 years
+
+init_train <- xt[1:train_window]
+
+aic <- Inf
+
+minAICp <- 0
+minAICq <- 0
+minAICP <- 0
+minAICQ <- 0
+
+vals <- seq(0, 1)
+
+for (p in vals){
+  for (q in vals){
+    for (P in vals){
+      for (Q in vals){
+        
+        fit <- tryCatch(
+          arima(init_train,
+                order = c(p, 1, q),
+                seasonal = list(order = c(P, 0, Q),
+                                period = 7),
+                method = 'ML'),
+          error = function(e) NULL
+        )
+        
+        if (!is.null(fit)){
+          
+          new_aic <- fit$aic
+        
+          if (new_aic < aic){
+            aic <- new_aic
+            
+            minAICp <- p
+            minAICq <- q
+            minAICP <- P
+            minAICQ <- Q
+          }
+          
+        }
+    
+        
+      }
+    }
+      
+  }
+}
+```
+
+
+# Fit ACF(p, q)
+
+```{r}
+library(tscount)
+
+LL <- tsglm(init_train,
+            model = list(past_mean = NULL,
+                         past_obs = NULL),
+            distr = 'poisson')$logLik
+
+maxLLp <- NULL
+maxLLq <- NULL
+
+vals <- c(NULL, seq(1, 5))
+
+for (p in vals){
+  for (q in vals){
+      
+    fit <- tsglm(init_train,
+               model = list(past_mean = c(p, 7),
+                            past_obs = c(q, 7)),
+               distr = 'poisson',
+               link = 'log',
+               init.method = 'marginal',
+               init.drop = F)
+  
+    if (fit$logLik > LL){
+      LL <- fit$logLik
+      
+      maxLLp <- p
+      maxLLq <- q
+    }
+      
+  }
+}
+```
+
+
+# Fit INGARCH with Negative Binomial
+
+```{r}
+LL <- tsglm(init_train,
+            model = list(past_mean = NULL,
+                         past_obs = NULL),
+            distr = 'nbinom')$logLik
+
+maxLLp2 <- NULL
+maxLLq2 <- NULL
+
+vals <- c(NULL, seq(1, 5))
+
+for (p in vals){
+  for (q in vals){
+      
+    fit <- tsglm(init_train,
+               model = list(past_mean = c(p, 7),
+                            past_obs = c(q, 7)),
+               distr = 'nbinom',
+               link = 'log',
+               init.method = 'marginal',
+               init.drop = F)
+  
+    if (fit$logLik > LL){
+      LL <- fit$logLik
+      
+      maxLLp2 <- p
+      maxLLq2 <- q
+    }
+      
+  }
+}
+```
+
+
+# Performance Comparison
+
+```{r}
+n <- length(xt)
+
+test_start <- train_window + 1
+```
+
+## ARIMA predictions
+
+```{r, results='hide'}
+arima_preds <- rep(NA, n)
+
+for(i in test_start:n){
+
+  train <- xt[(i-train_window):(i-1)]
+
+  fit <- arima(train,
+                order = c(minAICp, 1, minAICq),
+                seasonal = list(order = c(minAICP, 0, minAICQ),
+                                period = 7),
+                method = 'ML')
+  
+  pred <- predict(fit, n.ahead =1)
+
+  arima_preds[i] <- pred$pred
+}
+```
+
+
+## ACP predictions
+
+```{r}
+acp_preds <- rep(NA, n)
+
+for (i in test_start:n){
+
+  train <- xt[1:(i-1)]
+
+  fit <- tsglm(
+    train,
+    model = list(
+      past_mean = c(maxLLp,7),
+      past_obs = c(maxLLq,7)
+    ),
+    distr = 'poisson',
+    link = "log"
+  )
+
+  pred <- predict(fit, n.ahead = 1)
+
+  acp_preds[i] <- pred$pred
+}
+```
+
+## INGARCH Negative Binomial Predictions
+
+```{r}
+ingarch_preds <- rep(NA, n)
+
+for (i in test_start:n){
+
+  train <- xt[1:(i-1)]
+
+  fit <- tsglm(
+    train,
+    model = list(
+      past_mean = c(maxLLp2,7),
+      past_obs = c(maxLLq2,7)
+    ),
+    distr = 'nbinom',
+    link = "log"
+  )
+
+  pred <- predict(fit, n.ahead = 1)
+
+  ingarch_preds[i] <- pred$pred
+}
+```
+
+
+## Evaluate Results
+
+### Fitted ACP order
+
+```{r}
+paste('p =',
+      maxLLp,
+      'q =',
+      maxLLq)
+```
+
+### Fitted INGARCH order
+
+```{r}
+paste('p =',
+      maxLLp2,
+      'q =',
+      maxLLq2)
+```
+
+### Fitted SARIMA order
+
+```{r}
+paste('p =',
+      minAICp,
+      'q =',
+      minAICq,
+      'P =',
+      minAICP,
+      'Q =',
+      minAICQ)
+```
+
+### Combine Predictions
+
+```{r}
+results <- data.frame(
+  date = counts$date,
+  actual = xt,
+  arima = arima_preds,
+  acp = acp_preds,
+  ingarch = ingarch_preds
+)
+
+results_test <- results[test_start:n, ]
+
+head(results_test)
+```
+
+```{r}
+evaluate_metrics <- function(actual, forecasted) {
+  rmse <- sqrt(mean((actual - forecasted) ^ 2))
+  mae <- mean(abs(actual - forecasted))
+  mape <- mean(abs(actual - forecasted) / actual)
+  
+  data.frame(
+    RMSE = round(rmse, 2),
+    MAE  = round(mae, 2),
+    MAPE = round(mape, 2)
+  )
+}
+```
+
+
+
+```{r}
+results_df <- rbind(evaluate_metrics(results_test$actual, results_test$acp),
+                    evaluate_metrics(results_test$actual, results_test$ingarch),
+                    evaluate_metrics(results_test$actual, results_test$arima))
+
+rownames(results_df) <- c('ACP', 'INGARCH (NegBin)', 'ARIMA')
+
+results_df
+```
+
+```{r}
+results_long <- results_test %>%
+  pivot_longer(cols = c(actual, arima, acp, ingarch),
+               names_to = "Model",
+               values_to = "Count")
+
+p <- results_long %>% 
+  ggplot(aes(x = date, y = Count, color = Model)) +
+  geom_line(linewidth = 0.25) +
+  scale_color_manual(values = c(
+    "actual" = "black",
+    "arima" = "blue",
+    "acp" = "red",
+    "ingarch" = "green"
+  ),
+  labels = c("Actual", "ARIMA", "ACP", "INGARCH (Neg. Binom.)")) +
+  labs(title = "Predicted vs. Actual",
+       x = "Date",
+       y = "Count",
+       color = NULL) +
+  theme_minimal(base_size = 14) +    
+  theme(legend.position = "top")   
+
+ggsave("plots/pred_actual.png", plot = p, width = 8, height = 5, dpi = 300)
+```
+
+```{r}
+residuals <- results_test$actual - results_test$acp
+
+png('plots/acp_res.png', width = 600)
+
+acf(residuals,
+    main = 'ACF of ACP Residuals')
+
+dev.off()
+```
+
+```{r}
+residuals <- results_test$actual - results_test$arima
+
+png('plots/arima_res.png', width = 600)
+
+acf(residuals,
+    main = 'ACF of SARIMA Residuals')
+
+dev.off()
+```
+
+```{r}
+residuals <- results_test$actual - results_test$ingarch
+
+png('plots/ingarch_res.png', width = 600)
+
+acf(residuals,
+    main = 'ACF of INGARCH (Neg. Binom.) Residuals')
+
+dev.off()
+```
